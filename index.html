@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tensegrity Trace Assembler - Prototype</title>
+<style>
+body{font-family:system-ui,Arial;margin:18px;color:#222}
+#stage{width:480px;height:320px;border:1px solid #ccc;background:#fafafa}
+.controls{margin:8px 0}
+button{margin-right:6px}
+.module{font-size:13px;color:#444}
+.timestamp{font-weight:600}
+</style>
+</head>
+<body>
+<h3>TensegrityTraceAssembler — prototype</h3>
+<p>I am Marmalade. I like tidy timestamps and predictable motion. This demo normalizes two sample module traces (one CSV, one JSON), aligns them to 30Hz, and plays them on a simple handheld tensegrity mockup.</p>
+<div class="controls">
+<button id="normalize">Normalize</button>
+<button id="play" disabled>Play</button>
+<button id="download" disabled>Download Trace</button>
+<span id="status"></span>
+</div>
+<svg id="stage" viewBox="0 0 480 320"></svg>
+<script>
+// Sample inputs: module A as CSV, module B as JSON
+const sampleCSV = `time,tx,ty,tz,qw,qx,qy,qz
+0.00,0,0,0,1,0,0,0
+0.033,5,0,0,0.999,0.02,0,0
+0.067,10,2,0,0.995,0.05,0,0
+0.1,15,4,0,0.98,0.1,0,0
+`;
+const sampleJSON = {
+  module: 'B',
+  samples: [
+    {t: 0.0, pos:[0,60,0], rot:[1,0,0,0]},
+    {t: 0.05, pos:[-3,58,0], rot:[0.999,0,0.03,0]},
+    {t: 0.1, pos:[-6,55,0], rot:[0.995,0,0.09,0]}
+  ]
+};
+
+function parseCSV(csv){
+  const lines = csv.trim().split(/\r?\n/);
+  const hdr = lines.shift().split(',').map(h=>h.trim());
+  return lines.map(line=>{
+    const parts = line.split(',').map(s=>s.trim());
+    const obj = {};
+    hdr.forEach((h,i)=> obj[h]=parseFloat(parts[i]));
+    return {t: obj.time, pos:[obj.tx,obj.ty,obj.tz], rot:[obj.qw,obj.qx,obj.qy,obj.qz]};
+  });
+}
+
+function validateSamples(samples){
+  if(!samples.length) throw new Error('empty samples');
+  for(let i=1;i<samples.length;i++){
+    if(samples[i].t<=samples[i-1].t) throw new Error('non-increasing timestamps');
+  }
+}
+
+function resampleLinear(samples, t){
+  // find interval
+  if(t<=samples[0].t) return samples[0];
+  if(t>=samples[samples.length-1].t) return samples[samples.length-1];
+  let i=0; while(samples[i+1].t < t) i++;
+  const a=samples[i], b=samples[i+1];
+  const f = (t-a.t)/(b.t-a.t);
+  const pos = [0,1,2].map(j=> a.pos[j]*(1-f)+b.pos[j]*f);
+  const rot = [0,1,2,3].map(j=> a.rot[j]*(1-f)+b.rot[j]*f);
+  return {t,pos,rot};
+}
+
+function normalizeInputs(inputs, targetHz=30){
+  // inputs: {id, samples[]} where samples have {t,pos,rot}
+  inputs.forEach(i=>validateSamples(i.samples));
+  // determine common time range
+  const t0 = Math.max(...inputs.map(i=>i.samples[0].t));
+  const t1 = Math.min(...inputs.map(i=>i.samples[i.samples.length-1].t));
+  if(t1<=t0) throw new Error('no overlapping time range across modules');
+  const dt = 1/targetHz; const steps = Math.floor((t1-t0)/dt)+1;
+  const timeline = new Array(steps).fill(0).map((_,k)=> +(t0 + k*dt).toFixed(5));
+  const unified = timeline.map(t=>{
+    const frame = {t, modules:{}};
+    inputs.forEach(mod=>{
+      const s = resampleLinear(mod.samples, t);
+      frame.modules[mod.id] = {pos: s.pos, rot: s.rot};
+    });
+    return frame;
+  });
+  return {fps: targetHz, start:t0, end:t0+(steps-1)*dt, frames:unified};
+}
+
+// UI and simple mockup drawing
+const stage = document.getElementById('stage');
+const status = document.getElementById('status');
+let assembled = null;
+
+function drawFrame(frame){
+  stage.innerHTML = '';
+  // draw two modules as circles with position
+  Object.keys(frame.modules).forEach((id,idx)=>{
+    const m = frame.modules[id];
+    const x = 240 + m.pos[0];
+    const y = 160 + m.pos[1];
+    const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+    const c = document.createElementNS('http://www.w3.org/2000/svg','circle');
+    c.setAttribute('cx',x); c.setAttribute('cy',y); c.setAttribute('r',20);
+    c.setAttribute('fill', idx===0 ? '#f5b07e' : '#ffd88a');
+    c.setAttribute('stroke','#a55');
+    g.appendChild(c);
+    // simple orientation indicator
+    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+    const angle = (m.rot[1]||0)*Math.PI; // interpret qx as small tilt
+    const lx = x + Math.cos(angle)*24; const ly = y - Math.sin(angle)*24;
+    line.setAttribute('x1',x); line.setAttribute('y1',y); line.setAttribute('x2',lx); line.setAttribute('y2',ly);
+    line.setAttribute('stroke','#333'); line.setAttribute('stroke-width',2);
+    g.appendChild(line);
+    // label
+    const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+    txt.setAttribute('x',x); txt.setAttribute('y',y+36); txt.setAttribute('text-anchor','middle');
+    txt.setAttribute('font-size','12'); txt.textContent = id + ' t=' + frame.t.toFixed(3);
+    g.appendChild(txt);
+    stage.appendChild(g);
+  });
+}
+
+let playTimer = null; let playIndex = 0;
+
+document.getElementById('normalize').onclick = ()=>{
+  try{
+    status.textContent = ' normalizing...';
+    // prepare module inputs
+    const A = {id:'A', samples: parseCSV(sampleCSV)};
+    const B = {id:'B', samples: sampleJSON.samples.map(s=>({t:s.t, pos:s.pos, rot:s.rot}))};
+    const unified = normalizeInputs([A,B],30);
+    assembled = unified;
+    status.textContent = ` ready. frames=${unified.frames.length} fps=${unified.fps}`;
+    document.getElementById('play').disabled = false;
+    document.getElementById('download').disabled = false;
+  }catch(e){ status.textContent = ' error: '+e.message; }
+};
+
+document.getElementById('play').onclick = ()=>{
+  if(!assembled) return;
+  if(playTimer){ clearInterval(playTimer); playTimer=null; document.getElementById('play').textContent='Play'; return; }
+  playIndex=0; document.getElementById('play').textContent='Stop';
+  drawFrame(assembled.frames[0]);
+  playTimer = setInterval(()=>{
+    playIndex++;
+    if(playIndex>=assembled.frames.length){ clearInterval(playTimer); playTimer=null; document.getElementById('play').textContent='Play'; return; }
+    drawFrame(assembled.frames[playIndex]);
+  }, 1000/assembled.fps);
+};
+
+document.getElementById('download').onclick = ()=>{
+  if(!assembled) return;
+  const blob = new Blob([JSON.stringify(assembled,null,2)],{type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download='assembled_trace.json'; a.click(); URL.revokeObjectURL(url);
+};
+
+</script>
+</body>
+</html>
